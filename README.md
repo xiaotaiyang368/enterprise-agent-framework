@@ -115,22 +115,56 @@ L1 按企业价值流拆分为 8 个独立智能体：
 ## 与五要素运行时引擎的关系
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              Enterprise Agent Framework                   │
-│  定义「谁来做」（三层智能体的能力框架）                     │
-├─────────────────────────────────────────────────────────┤
-│                          调用                             │
-│                           ↓                               │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │           E5M Engine（五要素运行时引擎）              │  │
-│  │  定义「做什么」（事件·流程·对象·规则·行为）             │  │
-│  └────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+Enterprise Agent Framework           E5M Engine (或其他实现)
+「谁来做」                              「做什么」
+                                       
+┌─────────────────┐    协议接口     ┌─────────────────┐
+│  L0 决策智能体   │ ◄────────────► │   E5M Engine     │
+│  L1 运营智能体   │  World Model   │   (Event Hub)     │
+│  L2 个人助手     │  Provider      │   (Rule Engine)   │
+│                  │  Protocol      │   (Action Bridge) │
+│  依赖: 协议接口   │                │   (Flow Engine)   │
+│  不依赖具体实现   │                │   (知识图谱)      │
+└─────────────────┘                └─────────────────┘
 ```
 
-- **E5M Engine** — 提供运行时基础设施（Event Hub / Flow Engine / Rule Engine / Action Bridge）
-- **Enterprise Agent Framework** — 定义智能体的认知结构、协作模式、编排策略
-- 两者结合 = 智能体有「大脑」也有「身手」
+**设计要点：**
+
+1. **EAF 面向接口编程** — 通过 `WorldModelProvider` 抽象协议获取世界模型，不直接依赖 E5M Engine
+2. **可替换性** — 世界模型可替换为 LLM-Only 实现、第三方知识图谱或其他系统
+3. **E5M Engine 是参考实现** — 位于 [specs/protocols/](specs/protocols/) 中的协议定义和实现参考
+4. **运行时选择** — 通过配置指定 Provider 类型，无需改代码
+
+### 协议接口
+
+World Model Provider 协议定义在 `specs/protocols/world_model_provider.py`，包含：
+
+| 能力 | 说明 |
+|------|------|
+| 事件查询/投递 | 读取事件定义、投递新事件 |
+| 流程查询 | 读取流程定义和步骤 |
+| 对象查询 | 读取对象 Schema 和实例 |
+| 规则判定 | 执行规则并获取结果 |
+| 行为执行 | 执行预定义的行为 |
+| 图查询 | 关联方穿透和关系分析 |
+
+切换 Provider 示例：
+
+```python
+# 使用 E5M Engine
+from specs.protocols.e5m_engine_implementation import E5MEngineProvider
+provider = E5MEngineProvider(
+    event_hub_url="http://localhost:8000",
+    rule_engine_url="http://localhost:8001",
+)
+
+# 使用 LLM-Only（不依赖 E5M Engine）
+from my_impl.llm_provider import LLMWorldModelProvider
+provider = LLMWorldModelProvider(llm_client, model_defs=...)
+
+# Agent 使用 provider
+result = await provider.evaluate_rules(input_data={...})
+```
 
 ---
 
