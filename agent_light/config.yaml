@@ -1,0 +1,43 @@
+# Enterprise Agent Framework - 轻量化配置
+# 零 Docker 单进程部署
+
+app:
+  name: EAF Light
+  port: 6010
+  version: 0.1.0
+
+llm:
+  # 用于语义规则和 Agent 认知
+  api_key: "${EAF_LLM_API_KEY}"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+
+agents:
+  l0:
+    enabled: true
+    name: "决策智能体"
+    description: "企业战略认知与L1编排"
+  l1:
+    enabled: true
+    domains:
+      - "lead_capture"      # 商机捕获
+      - "sales_order"       # 销售订单
+      - "contract_review"   # 合同审核
+      - "rd_delivery"       # 研发交付
+      - "procurement"       # 采购管理
+      - "finance"           # 财务结算
+      - "hr"                # 人力资源
+      - "customer_service"  # 客户服务
+  l2:
+    enabled: true
+
+knowledge:
+  db_path: "data/eaf_knowledge.db"
+  auto_learn: true
+
+rules:
+  enabled: true
+  llm_fallback: true  # LLM 降级语义规则
+
+tools:
+  registry_path: "tools/"

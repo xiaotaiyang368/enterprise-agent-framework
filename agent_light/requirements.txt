@@ -1,0 +1,10 @@
+# EAF Light — 轻量依赖
+fastapi>=0.109.0
+pydantic>=2.5.0
+uvicorn>=0.27.0
+pyyaml>=6.0.1
+httpx>=0.26.0
+openai>=1.10.0  # 可选：语义规则需要
+# 测试依赖
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
