@@ -11,6 +11,31 @@ from . import core, knowledge, rules, tools
 
 logger = logging.getLogger("eaf.agents")
 
+# ═══════════════════════════════════════════
+# LLM 客户端（供 L0 规划、L2 ReAct 共享使用）
+# ═══════════════════════════════════════════
+
+_llm_client = None
+
+def _get_llm():
+    global _llm_client
+    if _llm_client is not None:
+        return _llm_client
+    api_key = os.environ.get("EAF_LLM_API_KEY")
+    base_url = os.environ.get("EAF_LLM_BASE_URL", "https://api.deepseek.com")
+    model = os.environ.get("EAF_LLM_MODEL", "deepseek-chat")
+    if not api_key:
+        logger.warning("EAF_LLM_API_KEY 未设置，LLM 推理将降级为规则匹配")
+        return None
+    try:
+        from openai import OpenAI
+        _llm_client = OpenAI(api_key=api_key, base_url=base_url)
+        _llm_client._eaf_model = model
+        return _llm_client
+    except ImportError:
+        logger.warning("openai 包未安装，LLM 推理降级")
+        return None
+
 
 # ═══════════════════════════════════════════
 # Agent 基类
@@ -68,12 +93,12 @@ class DecisionAgent(AgentBase):
 
         logger.info(f"[L0] 战略规划: {goal}")
 
-        # 1. 分析目标 → 确定影响领域
-        domains = self._analyze_goal(goal)
+        # 1. 分析目标 → 确定影响领域（LLM 优先，关键词降级）
+        domains = await self._analyze_goal(goal)
         logger.info(f"[L0] 影响领域: {domains}")
 
         # 2. 分解为子任务
-        tasks = self._decompose_goal(goal, domains)
+        tasks = await self._decompose_goal_with_llm(goal, domains)
 
         # 3. 编排到对应 L1
         results = []
@@ -116,63 +141,132 @@ class DecisionAgent(AgentBase):
             "results": results,
         }
 
-    def _analyze_goal(self, goal: str) -> list[str]:
-        """分析战略目标涉及哪些领域"""
-        # 基于关键词的简单匹配
+    async def _analyze_goal(self, goal: str) -> list[str]:
+        """分析战略目标涉及哪些领域（LLM 优先，关键词降级）"""
+        registered = list(self.l1_agents.keys())
+        domain_names = {
+            "procurement": "采购管理", "finance": "财务结算",
+            "sales_order": "销售订单", "contract_review": "合同审核",
+            "rd_delivery": "研发交付", "lead_capture": "商机捕获",
+            "hr": "人力资源", "customer_service": "客户服务",
+        }
+
+        # LLM 尝试
+        llm = _get_llm()
+        if llm:
+            try:
+                resp = llm.chat.completions.create(
+                    model=getattr(llm, "_eaf_model", "deepseek-chat"),
+                    messages=[
+                        {"role": "system", "content": "你是企业战略分析师。分析战略目标涉及哪些业务领域，返回最相关的 1-3 个领域。"},
+                        {"role": "user", "content": json.dumps({
+                            "goal": goal,
+                            "available_domains": {d: domain_names.get(d, d) for d in registered},
+                        }, ensure_ascii=False)},
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                text = resp.choices[0].message.content
+                text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+                data = json.loads(text)
+                domains = data.get("domains", data.get("domains", []))
+                if isinstance(domains, list):
+                    domains = [d for d in domains if d in registered]
+                    if domains:
+                        return domains
+            except Exception as e:
+                logger.warning(f"[L0] LLM 规划降级（{e}）")
+
+        # 降级：关键词匹配
         domain_keywords = {
-            "procurement": ["采购", "供应商", "supplier", "purchase", "procurement"],
-            "finance": ["财务", "付款", "结算", "报销", "finance", "payment", "invoice"],
-            "sales_order": ["销售", "订单", "客户", "sales", "order", "customer"],
+            "procurement": ["采购", "供应商", "supplier", "purchase"],
+            "finance": ["财务", "付款", "结算", "报销", "finance", "payment"],
+            "sales_order": ["销售", "订单", "客户", "sales", "order"],
             "contract_review": ["合同", "签约", "法务", "contract", "legal"],
-            "rd_delivery": ["研发", "交付", "开发", "产品", "rd", "delivery", "development"],
+            "rd_delivery": ["研发", "交付", "开发", "产品", "rd", "delivery"],
             "lead_capture": ["商机", "线索", "市场", "lead", "opportunity"],
-            "hr": ["人力", "招聘", "员工", "hr", "recruit", "onboard"],
+            "hr": ["人力", "招聘", "员工", "hr", "recruit"],
             "customer_service": ["客服", "售后", "服务", "service", "support"],
         }
         goal_lower = goal.lower()
         domains = []
-        # 使用所有已注册 L1 的领域
-        registered = set(self.l1_agents.keys())
         for domain, keywords in domain_keywords.items():
             if domain in registered:
                 for kw in keywords:
                     if kw in goal_lower or kw.lower() in goal_lower:
                         domains.append(domain)
                         break
-        return domains if domains else ["procurement"]  # 默认采购
+        return domains if domains else ["procurement"]
 
-    def _decompose_goal(self, goal: str, domains: list[str]) -> list[dict]:
-        """将战略目标分解为 L1 任务"""
+    async def _decompose_goal_with_llm(self, goal: str, domains: list[str]) -> list[dict]:
+        """将目标拆解为 L1 任务（LLM 细化描述，关键词兜底）"""
+        llm = _get_llm()
+        if llm and domains:
+            try:
+                domain_names_map = {
+                    "procurement": "采购管理", "finance": "财务结算",
+                    "sales_order": "销售订单", "contract_review": "合同审核",
+                    "rd_delivery": "研发交付", "lead_capture": "商机捕获",
+                    "hr": "人力资源", "customer_service": "客户服务",
+                }
+                resp = llm.chat.completions.create(
+                    model=getattr(llm, "_eaf_model", "deepseek-chat"),
+                    messages=[
+                        {"role": "system", "content": "将企业战略目标拆解为每个领域的具体执行任务。"},
+                        {"role": "user", "content": json.dumps({
+                            "goal": goal,
+                            "domains": [{"id": d, "name": domain_names_map.get(d, d)} for d in domains],
+                        }, ensure_ascii=False)},
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                text = resp.choices[0].message.content
+                text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+                data = json.loads(text)
+                tasks_data = data.get("tasks", [])
+                if isinstance(tasks_data, list) and tasks_data:
+                    tasks = []
+                    for t in tasks_data:
+                        d = t.get("domain", "")
+                        if d not in domains:
+                            continue
+                        tasks.append({
+                            "task_id": core.new_id("task"),
+                            "domain": d,
+                            "event_type": f"{d}.strategic_task",
+                            "goal": t.get("task", f"{d}: {goal}"),
+                            "priority": t.get("priority", "mid"),
+                            "payload": {"domain": d, "source_goal": goal,
+                                        "description": t.get("description", "")},
+                        })
+                    if tasks:
+                        return tasks
+            except Exception as e:
+                logger.warning(f"[L0] LLM 拆解降级（{e}）")
+
+        # 降级：模板化拆解
         tasks = []
         for domain in domains:
             event_type = f"{domain}.strategic_task"
             if domain == "procurement":
-                tasks.append({
-                    "task_id": core.new_id("task"),
-                    "domain": domain,
-                    "event_type": event_type,
-                    "goal": f"采购风险评估: {goal}",
-                    "payload": {"domain": domain, "source_goal": goal},
-                    "priority": "high",
-                })
+                goal_text = f"采购风险评估: {goal}"
+                priority = "high"
             elif domain == "finance":
-                tasks.append({
-                    "task_id": core.new_id("task"),
-                    "domain": domain,
-                    "event_type": event_type,
-                    "goal": f"财务合规审查: {goal}",
-                    "payload": {"domain": domain, "source_goal": goal},
-                    "priority": "high",
-                })
+                goal_text = f"财务合规审查: {goal}"
+                priority = "high"
             else:
-                tasks.append({
-                    "task_id": core.new_id("task"),
-                    "domain": domain,
-                    "event_type": event_type,
-                    "goal": f"{domain} 相关任务: {goal}",
-                    "payload": {"domain": domain, "source_goal": goal},
-                    "priority": "mid",
-                })
+                goal_text = f"{domain} 相关任务: {goal}"
+                priority = "mid"
+            tasks.append({
+                "task_id": core.new_id("task"),
+                "domain": domain,
+                "event_type": event_type,
+                "goal": goal_text,
+                "payload": {"domain": domain, "source_goal": goal},
+                "priority": priority,
+            })
         return tasks
 
 
@@ -311,39 +405,138 @@ class PersonalAssistant(AgentBase):
 
     async def execute_task(self, task: dict) -> dict:
         """
-        执行一个分配的任务
+        执行一个分配的任务（入口）
+        对复杂任务走 ReAct loop，简单/无 LLM 时走关键词匹配
         task: {task_id, goal, context, domain}
         """
-        self.status = "busy"
-        self.task_count += 1
         task_id = task.get("task_id", core.new_id("task"))
         goal = task.get("goal", "")
         context = task.get("context", {})
 
         logger.info(f"[L2/{self.role}] 执行任务: {goal[:50]}...")
 
-        # 1. 持久化任务
+        llm = _get_llm()
+        if llm and len(goal) > 10:
+            # LLM 可用且任务不 trivial → ReAct loop
+            return await self._run_react(task_id, goal, context)
+        else:
+            # 降级：关键词匹配
+            return await self._run_keyword(task_id, goal, task.get("domain", ""), context)
+
+    async def _run_react(self, task_id: str, goal: str,
+                         context: dict, max_steps: int = 8) -> dict:
+        """
+        ReAct Agent Loop: THINK → ACT → OBSERVE → ...
+        LLM 驱动，自行决策每一步调什么工具。
+        """
+        self.status = "busy"
+        self.task_count += 1
         knowledge.save_task(task_id, self.agent_id, goal, context)
 
-        # 2. 查询知识库
-        relevant_knowledge = knowledge.query_knowledge(
-            agent_type="l2", domain=task.get("domain"), limit=5
+        tools_desc = "\n".join(
+            f"- {t['tool_id']}: {t['description']}"
+            for t in self.tool_registry.list()
         )
 
-        # 3. 判断需要调用哪些工具
-        tool_calls = []
+        history = []
+        step = 0
+        done = False
+
+        while step < max_steps and not done:
+            step += 1
+
+            # THINK: LLM 决定下一步
+            try:
+                llm = _get_llm()
+                resp = llm.chat.completions.create(
+                    model=getattr(llm, "_eaf_model", "deepseek-chat"),
+                    messages=[
+                        {"role": "system", "content": (
+                            "你是智能个人助手。通过调用工具一步步完成任务。\n"
+                            "每步思考后决定：调用工具，或标记完成。\n"
+                            "可用工具:\n" + tools_desc
+                        )},
+                        {"role": "user", "content": json.dumps({
+                            "goal": goal,
+                            "context": {k: v for k, v in context.items()
+                                       if k not in ("password", "secret")},
+                            "completed_steps": [
+                                {"step": h["step"], "thought": h["thought"],
+                                 "tool": h["tool"], "result_summary": str(h["result"])[:200]}
+                                for h in history
+                            ],
+                            "current_step": step,
+                            "max_steps": max_steps,
+                        }, ensure_ascii=False)},
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+                text = resp.choices[0].message.content
+                text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+                decision = json.loads(text)
+            except Exception as e:
+                logger.warning(f"[L2] ReAct 第 {step} 步 LLM 失败: {e}")
+                break
+
+            action_type = decision.get("type", "action")
+
+            if action_type == "done":
+                done = True
+                history.append({"step": step, "thought": decision.get("thought", ""),
+                                "tool": "done", "params": {}, "result": {"status": "completed"}})
+                break
+
+            # ACT: 执行工具
+            tool_id = decision.get("tool_id", "")
+            params = decision.get("params", {})
+            thought = decision.get("thought", "")
+
+            tool = self.tool_registry.get(tool_id)
+            if tool:
+                result = await tool.execute(params)
+                history.append({
+                    "step": step, "thought": thought,
+                    "tool": tool_id, "params": params,
+                    "result": result,
+                })
+                logger.info(f"[L2] Step {step}: {tool_id} → {'✓' if result.get('success') else '✗'}")
+            else:
+                logger.warning(f"[L2] Step {step}: 未知工具 {tool_id}")
+
+        # 结果整理
+        output = {"goal": goal, "steps": step, "history": history}
+        knowledge.update_task_result(task_id, "completed" if done else "partial", output)
+        knowledge.add_knowledge("l2", "experience",
+                                json.dumps({"task": goal, "steps": step, "tools": [h["tool"] for h in history if h.get("tool")]},
+                                           ensure_ascii=False),
+                                domain="")
+
+        self.status = "idle"
+        return {"task_id": task_id, "status": "completed" if done else "partial",
+                "output": output}
+
+    async def _run_keyword(self, task_id: str, goal: str, domain: str,
+                           context: dict) -> dict:
+        """关键词匹配降级方案（原 execute_task 的逻辑）"""
+        self.status = "busy"
+        self.task_count += 1
+        knowledge.save_task(task_id, self.agent_id, goal, context)
+
+        relevant_knowledge = knowledge.query_knowledge(
+            agent_type="l2", domain=domain, limit=5
+        )
+
         goal_lower = goal.lower()
+        tool_calls = []
 
         if any(kw in goal_lower for kw in ["通知", "告知", "发送", "提醒", "notify"]):
             tool_calls.append({
                 "tool_id": "tool-notify",
-                "params": {
-                    "channel": "飞书",
-                    "recipients": context.get("recipients", [self.user_id]),
-                    "message": goal,
-                }
+                "params": {"channel": "飞书", "recipients": context.get("recipients", [self.user_id]),
+                           "message": goal},
             })
-        if any(kw in goal_lower for kw in ["报告", "文档", "报表", "report", "report"]):
+        if any(kw in goal_lower for kw in ["报告", "文档", "报表", "report"]):
             tool_calls.append({
                 "tool_id": "tool-report",
                 "params": {"title": goal, "content": str(context), "type": "approval"},
@@ -356,34 +549,22 @@ class PersonalAssistant(AgentBase):
         if any(kw in goal_lower for kw in ["会议", "安排", "日程", "meet", "schedule"]):
             tool_calls.append({
                 "tool_id": "tool-schedule",
-                "params": {"title": goal,
-                           "participants": context.get("participants", [self.user_id])},
+                "params": {"title": goal, "participants": context.get("participants", [self.user_id])},
             })
 
-        # 4. 执行工具
         tool_results = []
         for call in tool_calls:
             tool = self.tool_registry.get(call["tool_id"])
             if tool:
                 result = await tool.execute(call["params"])
-                tool_results.append({
-                    "tool_id": call["tool_id"],
-                    "params": call["params"],
-                    "result": result,
-                })
+                tool_results.append({"tool_id": call["tool_id"], "params": call["params"], "result": result})
 
-        # 5. 记录结果
-        output = {
-            "goal": goal,
-            "knowledge_used": len(relevant_knowledge),
-            "tools_called": len(tool_results),
-            "tool_results": tool_results,
-        }
+        output = {"goal": goal, "knowledge_used": len(relevant_knowledge),
+                  "tools_called": len(tool_results), "tool_results": tool_results}
         knowledge.update_task_result(task_id, "completed", output)
         knowledge.add_knowledge("l2", "experience",
-                                json.dumps({"task": goal, "tools": tool_calls},
-                                           ensure_ascii=False),
-                                domain=task.get("domain", ""))
+                                json.dumps({"task": goal, "tools": tool_calls}, ensure_ascii=False),
+                                domain=domain)
 
         self.status = "idle"
         return {"task_id": task_id, "status": "completed", "output": output}
